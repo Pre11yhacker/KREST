@@ -294,7 +294,7 @@ MIT License
 
 ## ⚡ KREST
 
-### The Purple Terminal AI Experience
+### The Terminal AI Experience
 
 <p>
 Built for developers • automation • cybersecurity • research
