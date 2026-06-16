@@ -268,7 +268,7 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
 
     def w(text): sys.stdout.write(text); sys.stdout.flush()
 
-    # ── Spinner ───────────────────────────────────────────────────
+    # ── Thinking bar ──────────────────────────────────────────────
     class SpinnerThread:
         def __init__(self, text="", style="green"):
             self.text = text
@@ -276,13 +276,7 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
             self.running = False
             self.thread = None
             self.status = None
-            self.frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-            self.phrases = [
-                "сканирую нейросети",
-                "шевелю извилинами",
-                "варганим решение",
-                "колдуем над кодом",
-            ]
+            self.start_time = None
 
         def __enter__(self):
             self.start()
@@ -293,26 +287,21 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
 
         def start(self):
             self.running = True
+            self.start_time = time.time()
             if has_rich and con:
-                self.status = con.status(f"[bold green]🧠 {self.phrases[0]}", spinner="dots12")
+                self.status = con.status("[bold green]Thinking", spinner="dots12")
                 self.status.__enter__()
-                def cycle():
-                    i = 0
-                    while self.running:
-                        self.status.update(f"[bold green]🧠 {self.phrases[i % len(self.phrases)]}")
-                        i += 1
-                        time.sleep(1.5)
-                t = threading.Thread(target=cycle, daemon=True)
-                t.start()
                 return
             def spin():
                 i = 0
+                frames = ["●○○○○○○○○○", "○●○○○○○○○○", "○○●○○○○○○○", "○○○●○○○○○○",
+                          "○○○○●○○○○○", "○○○○○●○○○○", "○○○○○○●○○○", "○○○○○○○●○○",
+                          "○○○○○○○○●○", "○○○○○○○○○●"]
                 while self.running:
-                    f = self.frames[i % len(self.frames)]
-                    p = self.phrases[(i // 10) % len(self.phrases)]
-                    w(f"\r{c(f, 'cyan')} {c(p, 'dim')}  ")
+                    elapsed = time.time() - self.start_time
+                    w(f"\rThinking {c(frames[i % len(frames)], 'cyan')} {c(f'{elapsed:.1f}s', 'dim')}  ")
                     i += 1
-                    time.sleep(0.08)
+                    time.sleep(0.1)
                 w("\r" + " " * 40 + "\r")
             self.thread = threading.Thread(target=spin, daemon=True)
             self.thread.start()
