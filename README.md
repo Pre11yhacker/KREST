@@ -106,7 +106,7 @@ KREST uses Rich UI to provide a modern terminal experience.
 ### Clone Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/KREST.git
+git clone https://github.com/Pre11yhacker/KREST.git
 
 cd KREST
 ```
