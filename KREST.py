@@ -345,6 +345,8 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
             t.append(f"  Terminal AI Assistant  ", style="dim")
             t.append(f"●  ", style="green")
             t.append(MODEL, style="cyan")
+            t.append(f"\n  made by tgk  ", style="dim")
+            t.append(f"●  t.me/s1lentpacket  ", style="magenta")
             t.append(f"\n  {OS_NAME} {ARCH}", style="dim")
             t.append(f"  ●  ", style="dim")
             t.append(f"session: {SID}", style="dim")
@@ -367,6 +369,7 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
             w(c(line, clr, "bold") + "\n")
         w(c("  ────────────────────────────────────────────", "dim") + "\n")
         w(c(f"  Terminal AI Assistant  ●  {MODEL}", "dim") + "\n")
+        w(c(f"  made by tgk  ●  t.me/s1lentpacket", "dim") + "\n")
         w(c(f"  {OS_NAME} {ARCH}  ●  session: {SID}", "dim") + "\n\n")
 
     # ── Help ──────────────────────────────────────────────────────
