@@ -275,7 +275,14 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
             self.style = style
             self.running = False
             self.thread = None
+            self.status = None
             self.frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+            self.phrases = [
+                "сканирую нейросети",
+                "шевелю извилинами",
+                "варганим решение",
+                "колдуем над кодом",
+            ]
 
         def __enter__(self):
             self.start()
@@ -285,23 +292,36 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
             self.stop()
 
         def start(self):
-            if has_rich and con:
-                self.running = True
-                return  # Rich handles it via console.status
             self.running = True
+            if has_rich and con:
+                self.status = con.status(f"[bold green]🧠 {self.phrases[0]}", spinner="dots12")
+                self.status.__enter__()
+                def cycle():
+                    i = 0
+                    while self.running:
+                        self.status.update(f"[bold green]🧠 {self.phrases[i % len(self.phrases)]}")
+                        i += 1
+                        time.sleep(1.5)
+                t = threading.Thread(target=cycle, daemon=True)
+                t.start()
+                return
             def spin():
                 i = 0
                 while self.running:
                     f = self.frames[i % len(self.frames)]
-                    w(f"\r{c(f, 'cyan')} {c(self.text, 'dim')}  ")
+                    p = self.phrases[(i // 10) % len(self.phrases)]
+                    w(f"\r{c(f, 'cyan')} {c(p, 'dim')}  ")
                     i += 1
                     time.sleep(0.08)
-                w("\r" + " " * (len(self.text) + 8) + "\r")
+                w("\r" + " " * 40 + "\r")
             self.thread = threading.Thread(target=spin, daemon=True)
             self.thread.start()
 
         def stop(self):
             self.running = False
+            if self.status:
+                self.status.__exit__(None, None, None)
+                self.status = None
             if self.thread:
                 self.thread.join(timeout=0.5)
 
@@ -657,32 +677,12 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
 
         # Stream output with tags hidden
         full = ""
-        cols = get_terminal_size().columns
         tag_re = re.compile(r'\[(?:SEARCH|READ|WRITE|RUN):[^\]]*\]')
 
-        if has_rich:
-            con.print()
-            with Live(Panel("", title="[bold green]krEST@root:~$[/]", border_style="green", padding=(1, 2)),
-                      refresh_per_second=15, vertical_overflow="visible") as live:
-                while True:
-                    chunk = resp_obj.readline()
-                    if not chunk: break
-                    line = chunk.decode("utf-8", errors="replace").strip()
-                    if line.startswith("data: "):
-                        payload = line[6:]
-                        if payload == "[DONE]": break
-                        try:
-                            d = json.loads(payload)
-                            delta = d.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                            if delta:
-                                full += delta
-                                stripped = tag_re.sub('', full).strip()
-                                if not stripped: stripped = "⏳ searching..."
-                                live.update(Panel(Markdown(stripped), title="[bold green]krEST@root:~$[/]", border_style="green", padding=(1, 2)))
-                        except: continue
-        else:
+        def read_loop(stream):
+            nonlocal full
             while True:
-                chunk = resp_obj.readline()
+                chunk = stream.readline()
                 if not chunk: break
                 line = chunk.decode("utf-8", errors="replace").strip()
                 if line.startswith("data: "):
@@ -691,13 +691,31 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
                     try:
                         d = json.loads(payload)
                         delta = d.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if delta: full += delta
+                        if delta:
+                            full += delta
+                            yield delta
                     except: continue
-            display = tag_re.sub('', full).strip()
-            if not display: display = "⏳ searching..."
+
+        gen = read_loop(resp_obj)
+        pre = ""
+        for delta in gen:
+            pre += delta
+            if tag_re.sub('', pre).strip():
+                break
+
+        display = tag_re.sub('', full).strip()
+        if display and has_rich:
+            with Live(Panel(Markdown(display), title="[bold green]krEST@root:~$[/]", border_style="green", padding=(1, 2)),
+                      console=con, refresh_per_second=15) as live:
+                for delta in gen:
+                    d2 = tag_re.sub('', full).strip()
+                    if d2:
+                        live.update(Panel(Markdown(d2), title="[bold green]krEST@root:~$[/]", border_style="green", padding=(1, 2)))
+        elif display:
             w(f"\n")
             for txt_line in display.split("\n"):
                 w(f"  {c(txt_line, 'white')}\n")
+            for _ in gen: pass
 
         # If the response was only tags (empty after stripping), don't save it
         is_tag_only = not tag_re.sub('', full).strip()
@@ -716,26 +734,10 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
                 resp2 = query_ai(msgs2, stream=True)
             if not isinstance(resp2, tuple):
                 full2 = ""
-                if has_rich:
-                    con.print()
-                    with Live(Panel("", title="[bold green]krEST@root:~$[/]", border_style="green", padding=(1, 2)), refresh_per_second=15, vertical_overflow="visible") as live:
-                        while True:
-                            chunk = resp2.readline()
-                            if not chunk: break
-                            line = chunk.decode("utf-8", errors="replace").strip()
-                            if line.startswith("data: "):
-                                payload = line[6:]
-                                if payload == "[DONE]": break
-                                try:
-                                    d = json.loads(payload)
-                                    delta = d.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                                    if delta:
-                                        full2 += delta
-                                        live.update(Panel(Markdown(full2), title="[bold green]krEST@root:~$[/]", border_style="green", padding=(1, 2)))
-                                except: continue
-                else:
+                def read_loop2(stream):
+                    nonlocal full2
                     while True:
-                        chunk = resp2.readline()
+                        chunk = stream.readline()
                         if not chunk: break
                         line = chunk.decode("utf-8", errors="replace").strip()
                         if line.startswith("data: "):
@@ -744,11 +746,30 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
                             try:
                                 d = json.loads(payload)
                                 delta = d.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                                if delta: full2 += delta
+                                if delta:
+                                    full2 += delta
+                                    yield delta
                             except: continue
+
+                gen2 = read_loop2(resp2)
+                pre = ""
+                for delta in gen2:
+                    pre += delta
+                    if pre.strip():
+                        break
+
+                if full2.strip() and has_rich:
+                    with Live(Panel(Markdown(full2.strip()), title="[bold green]krEST@root:~$[/]", border_style="green", padding=(1, 2)),
+                              console=con, refresh_per_second=15) as live:
+                        for delta in gen2:
+                            d2 = full2.strip()
+                            if d2:
+                                live.update(Panel(Markdown(d2), title="[bold green]krEST@root:~$[/]", border_style="green", padding=(1, 2)))
+                elif full2.strip():
                     w(f"\n")
                     for txt_line in full2.strip().split("\n"):
                         w(f"  {c(txt_line, 'white')}\n")
+                    for _ in gen2: pass
                 # Replace the first response with the synthesized one
                 messages.append({"role": "assistant", "content": (tag_re.sub('', full).strip() + "\n\n" + full2) if not is_tag_only else full2})
                 save_session()
