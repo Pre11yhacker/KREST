@@ -7,7 +7,53 @@ from shutil import get_terminal_size
 
 warnings.filterwarnings("ignore")
 
+# Telegram bot (optional)
+HAS_TELEBOT = False
+try:
+    import telebot
+    HAS_TELEBOT = True
+except ImportError:
+    pass
+
 def main():
+    # ── Auto-install missing dependencies ─────────────────────────
+    _has_telebot = HAS_TELEBOT
+    _telebot_mod = None
+    try:
+        _telebot_mod = telebot
+    except:
+        pass
+    _missing_deps = []
+    for _mod, _pkg in [
+        ("rich", "rich"),
+        ("duckduckgo_search", "duckduckgo_search"),
+        ("dotenv", "python-dotenv"),
+        ("psutil", "psutil"),
+        ("telebot", "pyTelegramBotAPI"),
+    ]:
+        try:
+            __import__(_mod)
+        except ImportError:
+            _missing_deps.append(_pkg)
+    if _missing_deps:
+        print(f"\n⚡ KREST: installing {len(_missing_deps)} missing package(s)...")
+        for _p in _missing_deps:
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", _p, "-q"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f"  ✓ {_p}")
+            except Exception as _e:
+                print(f"  ✗ {_p} (pip failed: {_e})")
+        print()
+        # Re-check telebot after auto-install
+        try:
+            import telebot
+            _has_telebot = True
+            _telebot_mod = telebot
+        except:
+            pass
+
     # Rich setup (optional)
     has_rich = False
     try:
@@ -59,6 +105,7 @@ def main():
     for d in ["memory", "code", "logs"]:
         os.makedirs(os.path.join(WORKSPACE, d), exist_ok=True)
     MEM_DIR = os.path.join(WORKSPACE, "memory")
+    TG_CONFIG_PATH = os.path.join(WORKSPACE, "tgbot_config.json")
     SID = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
         from dotenv import load_dotenv
@@ -314,6 +361,1027 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
             if self.thread:
                 self.thread.join(timeout=0.5)
 
+    # ── Telegram Bot ──────────────────────────────────────────────
+    telegram_bot_instance = [None]
+
+    class TelegramBotInstance:
+        def __init__(self, token, trusted_id, web_search_fn, system_prompt, model, api_url, api_token):
+            self.token = token
+            self.trusted_id = trusted_id
+            self.web_search = web_search_fn
+            self.system = system_prompt
+            self.model = model
+            self.api_url = api_url
+            self.api_token = api_token
+            import telebot
+            self.bot = telebot.TeleBot(token)
+            self.running = False
+            self.thread = None
+            self.messages = [{"role": "system", "content": system_prompt}]
+            self._all_models = []
+            self._model_page = 0
+            _kr = os.path.join(os.path.expanduser("~"), "KREST")
+            self._skills_dir = os.path.join(_kr, "skills")
+            self._profile_path = os.path.join(_kr, "memory", "user_profile.json")
+            self._skills = {}
+            self._memory = {"facts": [], "preferences": {}, "learnings": []}
+            self._stats = {"queries": 0, "tags_ok": 0, "tags_fail": 0, "feedbacks": []}
+            os.makedirs(self._skills_dir, exist_ok=True)
+            self._load_skills()
+            self._load_memory()
+            self._setup_handlers()
+
+        # ── Skills ────────────────────────────────────────────────
+        def _load_skills(self):
+            self._skills = {}
+            for fp in sorted(Path(self._skills_dir).glob("*.json")):
+                try:
+                    d = json.load(open(fp, encoding="utf-8"))
+                    self._skills[d["name"]] = d
+                except: pass
+
+        def _save_skill(self, name, data):
+            data["name"] = name
+            path = os.path.join(self._skills_dir, f"{name}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._skills[name] = data
+
+        def _remove_skill(self, name):
+            path = os.path.join(self._skills_dir, f"{name}.json")
+            if os.path.exists(path):
+                os.remove(path)
+            self._skills.pop(name, None)
+
+        def _match_skills(self, text):
+            text_lower = text.lower()
+            matched = []
+            for name, skill in self._skills.items():
+                if not skill.get("enabled", True):
+                    continue
+                for trigger in skill.get("triggers", []):
+                    if trigger.lower() in text_lower:
+                        matched.append(skill)
+                        break
+            return matched
+
+        # ── Memory ─────────────────────────────────────────────────
+        def _load_memory(self):
+            if os.path.exists(self._profile_path):
+                try:
+                    with open(self._profile_path, "r", encoding="utf-8") as f:
+                        self._memory = json.load(f)
+                except: pass
+
+        def _save_memory(self):
+            try:
+                os.makedirs(os.path.dirname(self._profile_path), exist_ok=True)
+                with open(self._profile_path, "w", encoding="utf-8") as f:
+                    json.dump(self._memory, f, ensure_ascii=False, indent=2)
+            except: pass
+
+        def _learn(self, fact):
+            if fact not in self._memory["facts"]:
+                self._memory["facts"].append(fact)
+                if len(self._memory["facts"]) > 200:
+                    self._memory["facts"] = self._memory["facts"][-200:]
+                self._save_memory()
+
+        def _memory_context(self):
+            parts = []
+            if self._memory.get("facts"):
+                parts.append("Known facts about the user:\n- " + "\n- ".join(self._memory["facts"]))
+            if self._memory.get("learnings"):
+                parts.append("Learning from past interactions:\n- " + "\n- ".join(self._memory["learnings"]))
+            if self._memory.get("preferences"):
+                prefs = self._memory["preferences"]
+                parts.append("User preferences: " + json.dumps(prefs, ensure_ascii=False))
+            if parts:
+                return "\n\n".join(parts)
+            return ""
+
+        def _handle_learn_tag(self, text):
+            for m in re.finditer(r'\[LEARN:\s*([^\]]+?)\]', text):
+                fact = m.group(1).strip()
+                self._learn(fact)
+
+        def _handle_skill_tag(self, text):
+            for m in re.finditer(r'\[SKILL:\s*([^\]]+?)\s*::\s*([^\]]+?)\s*::\s*([^\]]*)\]', text):
+                name = m.group(1).strip()
+                trigger = m.group(2).strip()
+                prompt = m.group(3).strip()
+                if name and trigger:
+                    self._save_skill(name, {"triggers": [t.strip() for t in trigger.split(",")], "prompt": prompt, "enabled": True})
+
+        def _setup_handlers(self):
+            import telebot as _tb
+            bot = self.bot
+            tid = self.trusted_id
+
+            def _help_msg():
+                return (
+                    '<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> '
+                    "<b>KREST Telegram Bot</b> — AI coding assistant\n\n"
+                    "<b>Commands:</b>\n"
+                    "<code>/start</code> — This message\n"
+                    "<code>/help</code> — Show this help\n"
+                    "<code>/clear</code> — Reset conversation\n"
+                    "<code>/model</code> — Show or change AI model\n"
+                    "<code>/models</code> — List ALL models & pick via inline buttons\n"
+                    "<code>/context</code> — Conversation stats\n"
+                    "<code>/sys</code> — System info\n"
+                    "<code>/stats</code> — CPU / RAM / disk usage\n"
+                    "<code>/save</code> — Save current session\n"
+                    "<code>/export</code> — Export session\n"
+                    "<code>/skills</code> — List AI skills\n"
+                    "<code>/skill add|remove|toggle &lt;name&gt;</code> — Manage skills\n"
+                    "<code>/feedback</code> — Help me improve\n\n"
+                    "You can also send me photos, voice messages, or files!"
+                )
+
+            @bot.message_handler(commands=['start', 'help'])
+            def send_welcome(m):
+                if m.from_user.id != tid: return
+                self._send_keyboard(m.chat.id)
+                bot.reply_to(m, _help_msg(), parse_mode="HTML")
+
+            @bot.message_handler(commands=['clear'])
+            def cmd_clear(m):
+                if m.from_user.id != tid: return
+                self.messages = [{"role": "system", "content": self.system}]
+                bot.reply_to(m,
+                    '<tg-emoji emoji-id="5870982283724328568">⚙</tg-emoji> Conversation cleared',
+                    parse_mode="HTML")
+
+            @bot.message_handler(commands=['model'])
+            def cmd_model(m):
+                if m.from_user.id != tid: return
+                parts = m.text.split(maxsplit=1)
+                if len(parts) == 2:
+                    self.model = parts[1].strip()
+                    bot.reply_to(m,
+                        '<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Model set to: <code>%s</code>' % self.model,
+                        parse_mode="HTML")
+                else:
+                    self._show_model_picker(m.chat.id, bot)
+
+            @bot.message_handler(commands=['models'])
+            def cmd_models(m):
+                if m.from_user.id != tid: return
+                self._show_model_picker(m.chat.id, bot)
+
+            @bot.message_handler(commands=['context'])
+            def cmd_context(m):
+                if m.from_user.id != tid: return
+                total_chars = sum(len(msg.get("content", "")) for msg in self.messages)
+                bot.reply_to(m,
+                    '<tg-emoji emoji-id="5870921681735781843">📊</tg-emoji> <b>Context</b>\n'
+                    f'Messages: <code>{len(self.messages)}</code>\n'
+                    f'Total chars: <code>{total_chars}</code>\n'
+                    f'Model: <code>{self.model}</code>',
+                    parse_mode="HTML")
+
+            @bot.message_handler(commands=['sys'])
+            def cmd_sys(m):
+                if m.from_user.id != tid: return
+                import platform as _pf
+                bot.reply_to(m,
+                    '<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> <b>System</b>\n'
+                    f'OS: <code>{_pf.system()} ({_pf.machine()})</code>\n'
+                    f'Python: <code>{sys.version.split()[0]}</code>\n'
+                    f'Model: <code>{self.model}</code>',
+                    parse_mode="HTML")
+
+            @bot.message_handler(commands=['stats'])
+            def cmd_stats(m):
+                if m.from_user.id != tid: return
+                try:
+                    import psutil as _ps
+                    cpu = _ps.cpu_percent(interval=0.5)
+                    mem = _ps.virtual_memory()
+                    disk = _ps.disk_usage(os.path.sep)
+                    bot.reply_to(m,
+                        '<tg-emoji emoji-id="5870930636742595124">📊</tg-emoji> <b>Stats</b>\n'
+                        f'CPU: <code>{cpu}%</code>\n'
+                        f'RAM: <code>{mem.used//1024**3}/{mem.total//1024**3} GB ({mem.percent}%)</code>\n'
+                        f'Disk: <code>{disk.used//1024**3}/{disk.total//1024**3} GB ({disk.percent}%)</code>',
+                        parse_mode="HTML")
+                except ImportError:
+                    bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> psutil not installed', parse_mode="HTML")
+
+            @bot.message_handler(commands=['save', 'export'])
+            def cmd_save(m):
+                if m.from_user.id != tid: return
+                import datetime as _dt
+                sid = _dt.datetime.now().strftime("tgbot_%Y%m%d_%H%M%S")
+                path = os.path.join(os.path.join(os.path.expanduser("~"), "KREST", "memory"), f"{sid}.json")
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump({"session": sid, "model": self.model, "messages": self.messages},
+                            f, ensure_ascii=False, indent=2)
+                    bot.reply_to(m,
+                        '<tg-emoji emoji-id="5870528606328852614">📁</tg-emoji> Session saved: <code>%s</code>' % sid,
+                        parse_mode="HTML")
+                except Exception as e:
+                    bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Save failed: %s' % str(e)[:200], parse_mode="HTML")
+
+            @bot.message_handler(commands=['skills'])
+            def cmd_skills(m):
+                if m.from_user.id != tid: return
+                if not self._skills:
+                    bot.reply_to(m, "No skills. Add one with <code>/skill add &lt;name&gt;</code>", parse_mode="HTML")
+                    return
+                lines = ['<b>Skills (%s):</b>' % len(self._skills)]
+                for name, s in self._skills.items():
+                    status_tag = '<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji>' if s.get("enabled", True) else "⛔"
+                    triggers = ", ".join(s.get("triggers", []))
+                    lines.append('%s <code>%s</code> \u2014 triggers: <code>%s</code>' % (status_tag, name, triggers))
+                bot.reply_to(m, "\n".join(lines), parse_mode="HTML")
+
+            @bot.message_handler(commands=['skill'])
+            def cmd_skill(m):
+                if m.from_user.id != tid: return
+                parts = m.text.split(maxsplit=2)
+                if len(parts) < 2:
+                    bot.reply_to(m,
+                        'Usage:\n'
+                        '<code>/skill add &lt;name&gt;</code> \u2014 create skill\n'
+                        '<code>/skill remove &lt;name&gt;</code> \u2014 delete\n'
+                        '<code>/skill toggle &lt;name&gt;</code> \u2014 on/off',
+                        parse_mode="HTML")
+                    return
+                action = parts[1].lower()
+                if len(parts) < 3:
+                    bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Missing skill name', parse_mode="HTML")
+                    return
+                name = parts[2].strip()
+                if action == "remove":
+                    self._remove_skill(name)
+                    bot.reply_to(m, '<tg-emoji emoji-id="5870875489362513438">🗑️</tg-emoji> Removed <code>%s</code>' % name, parse_mode="HTML")
+                elif action == "toggle":
+                    if name in self._skills:
+                        self._skills[name]["enabled"] = not self._skills[name].get("enabled", True)
+                        self._save_skill(name, self._skills[name])
+                        st = '<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> enabled' if self._skills[name]["enabled"] else "⛔ disabled"
+                        bot.reply_to(m, '<code>%s</code> %s' % (name, st), parse_mode="HTML")
+                    else:
+                        bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Skill <code>%s</code> not found' % name, parse_mode="HTML")
+                elif action == "add":
+                    bot.reply_to(m,
+                        '<tg-emoji emoji-id="5870676941614354370">✏\ufe0f</tg-emoji> Creating skill <code>%s</code>.\n'
+                        'Send the <b>trigger words</b> (comma-separated):\n'
+                        'Example: <code>python, \u043a\u043e\u0434, script</code>' % name,
+                        parse_mode="HTML")
+                    bot.register_next_step_handler(m, lambda msg: _skill_step2(msg, name))
+
+            def _skill_step2(msg, name):
+                if msg.from_user.id != tid: return
+                triggers = [t.strip() for t in msg.text.split(",") if t.strip()]
+                if not triggers:
+                    bot.reply_to(msg, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> At least one trigger required. Start over with <code>/skill add</code>', parse_mode="HTML")
+                    return
+                bot.reply_to(msg,
+                    '<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Good! Triggers: <code>%s</code>\n'
+                    'Now send the <b>system prompt</b> for this skill:\n'
+                    'Example: <code>You are a Python expert. Write clean code.</code>' % ", ".join(triggers),
+                    parse_mode="HTML")
+                bot.register_next_step_handler(msg, lambda msg: _skill_step3(msg, name, triggers))
+
+            def _skill_step3(msg, name, triggers):
+                if msg.from_user.id != tid: return
+                prompt = msg.text.strip()
+                if not prompt:
+                    bot.reply_to(msg, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Prompt cannot be empty. Start over with <code>/skill add</code>', parse_mode="HTML")
+                    return
+                self._save_skill(name, {"triggers": triggers, "prompt": prompt, "enabled": True})
+                bot.reply_to(msg, '<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Skill <code>%s</code> created! Triggers will auto-activate on matching messages.' % name, parse_mode="HTML")
+
+            @bot.message_handler(commands=['feedback'])
+            def cmd_feedback(m):
+                if m.from_user.id != tid: return
+                parts = m.text.split(maxsplit=1)
+                fb = parts[1].strip() if len(parts) > 1 else ""
+                if not fb:
+                    bot.reply_to(m, 'Send feedback: <code>/feedback your message here</code>', parse_mode="HTML")
+                    return
+                self._stats.setdefault("feedbacks", []).append({"text": fb, "time": datetime.now().isoformat()})
+                self._learn(f"User feedback: {fb}")
+                bot.reply_to(m, '<tg-emoji emoji-id="6039422865189638057">📣</tg-emoji> Thanks for the feedback! I\'ll use it to improve.', parse_mode="HTML")
+
+            @bot.callback_query_handler(func=lambda c: c.from_user.id == tid and (c.data.startswith("mdl:") or c.data.startswith("pg:")))
+            def handle_callback(c):
+                if c.data.startswith("mdl:"):
+                    model_id = c.data[4:]
+                    self.model = model_id
+                    bot.answer_callback_query(c.id, text=f"✅ {model_id}")
+                    bot.edit_message_text(
+                        '<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> Model selected: <code>%s</code>' % model_id,
+                        chat_id=c.message.chat.id,
+                        message_id=c.message.message_id,
+                        parse_mode="HTML")
+                elif c.data.startswith("pg:"):
+                    page_str = c.data[3:]
+                    if page_str == "noop":
+                        bot.answer_callback_query(c.id)
+                        return
+                    self._model_page = int(page_str)
+                    self._all_models = getattr(self, "_all_models", [])
+                    if not self._all_models:
+                        bot.answer_callback_query(c.id, text="❌ No models cached, send /models again")
+                        return
+                    bot.answer_callback_query(c.id)
+                    self._send_model_page(c.message.chat.id, c.message.message_id)
+
+            @bot.message_handler(func=lambda m: m.from_user.id == tid and m.text and not m.text.startswith("/"), content_types=['text'])
+            def handle_text(m):
+                txt = m.text.strip()
+                if txt == "Clear":
+                    self.messages = [{"role": "system", "content": self.system}]
+                    bot.reply_to(m,
+                        '<tg-emoji emoji-id="5870982283724328568">⚙</tg-emoji> Cleared',
+                        parse_mode="HTML")
+                elif txt == "Help":
+                    bot.reply_to(m, _help_msg(), parse_mode="HTML")
+                elif txt == "Model":
+                    self._show_model_picker(m.chat.id, bot)
+                elif txt == "Save":
+                    m.text = "/save"
+                    cmd_save(m)
+                elif txt == "Skills":
+                    m.text = "/skills"
+                    cmd_skills(m)
+                elif txt == "Stats":
+                    m.text = "/stats"
+                    cmd_stats(m)
+                elif txt == "Context":
+                    m.text = "/context"
+                    cmd_context(m)
+                elif txt == "Feedback":
+                    bot.reply_to(m, 'Send feedback: <code>/feedback your message</code>', parse_mode="HTML")
+                else:
+                    self._process_user_message(m, txt)
+
+            @bot.message_handler(func=lambda m: m.from_user.id == tid, content_types=['photo'])
+            def handle_photo(m):
+                self._process_photo(m)
+
+            @bot.message_handler(func=lambda m: m.from_user.id == tid, content_types=['voice'])
+            def handle_voice(m):
+                self._process_voice(m)
+
+            @bot.message_handler(func=lambda m: m.from_user.id == tid, content_types=['document'])
+            def handle_document(m):
+                self._process_document(m)
+
+            # Send the menu keyboard on startup
+            try:
+                self._send_keyboard(tid)
+            except:
+                pass
+
+        def _query_ai(self, msgs):
+            data = json.dumps({
+                "model": self.model, "messages": msgs,
+                "max_tokens": 2048, "temperature": 0.7, "top_p": 0.9
+            }).encode('utf-8')
+            req = urllib.request.Request(self.api_url, data=data, headers={
+                "Authorization": f"Bearer {self.api_token}",
+                "Content-Type": "application/json"
+            })
+            for _ in range(3):
+                try:
+                    resp = urllib.request.urlopen(req, timeout=180)
+                    result = json.loads(resp.read().decode('utf-8'))
+                    return result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode('utf-8', errors='replace')
+                    if e.code == 503 and "loading" in body:
+                        time.sleep(10)
+                        continue
+                    return None
+                except Exception as e:
+                    return None
+            return None
+
+        def _exec_tags(self, text):
+            results = []
+            for m in re.finditer(r'\[SEARCH:\s*([^\]]+?)\]', text):
+                q = m.group(1).strip()
+                res = self.web_search(q)
+                results.append(("search", q, res))
+            for m in re.finditer(r'\[READ:\s*([^\]]+)\]', text):
+                p = m.group(1).strip().strip('"').strip("'")
+                if os.path.exists(p):
+                    try:
+                        with open(p, 'r', encoding='utf-8') as f:
+                            c = f.read()
+                        results.append(("read", p, c))
+                    except Exception as e:
+                        results.append(("read", p, f"[error] {e}"))
+            for m in re.finditer(r'\[WRITE:\s*([^\]]+?)\s*::\s*([^\]]*)\]', text):
+                p, c = m.group(1).strip(), m.group(2)
+                try:
+                    os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+                    with open(p, 'w', encoding='utf-8') as f:
+                        f.write(c)
+                    results.append(("write", p, f"{len(c)} bytes written"))
+                except Exception as e:
+                    results.append(("write", p, f"[error] {e}"))
+            for m in re.finditer(r'\[RUN:\s*([^\]]+)\]', text):
+                cmd = m.group(1).strip()
+                try:
+                    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                    out = (r.stdout or "")[:2000] + ("\n"+r.stderr[:500] if r.stderr else "")
+                    results.append(("run", cmd, out))
+                except subprocess.TimeoutExpired:
+                    results.append(("run", cmd, "[timed out]"))
+                except Exception as e:
+                    results.append(("run", cmd, f"[error] {e}"))
+            return results
+
+        def _process_user_message(self, m, text, extra_context=""):
+            self._stats["queries"] = self._stats.get("queries", 0) + 1
+            content = text
+            if extra_context:
+                content = f"{text}\n\n{extra_context}"
+
+            # Inject skills + memory into system prompt
+            sys_prompt = self.system
+            mem_ctx = self._memory_context()
+            if mem_ctx:
+                sys_prompt += f"\n\n── MEMORY ──\n{mem_ctx}\n── END MEMORY ──"
+            matched_skills = self._match_skills(content)
+            for skill in matched_skills:
+                sys_prompt += f"\n\n── SKILL: {skill['name']} ──\n{skill['prompt']}\n── END SKILL ──"
+
+            # Telegram: code → files instruction
+            sys_prompt += (
+                "\n\n── TELEGRAM FORMAT ──\n"
+                "When writing code, ALWAYS use ```language ... ``` fenced blocks. "
+                "The bot will extract every code block and send it as a file attachment. "
+                "Write explanations, descriptions, and usage instructions OUTSIDE the code blocks. "
+                "Do NOT repeat the code in plain text — only inside fenced blocks."
+            )
+
+            msgs = [{"role": "system", "content": sys_prompt}]
+            for msg in self.messages[1:]:
+                msgs.append(msg)
+            msgs.append({"role": "user", "content": content})
+            if len(msgs) > 120:
+                msgs = [msgs[0]] + msgs[-100:]
+
+            self.bot.send_chat_action(m.chat.id, 'typing')
+
+            resp = self._query_ai(msgs)
+            if resp is None:
+                self.bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> AI request failed', parse_mode="HTML")
+                return
+
+            # Handle learning tags
+            if "[LEARN:" in resp:
+                self._handle_learn_tag(resp)
+            if "[SKILL:" in resp:
+                self._handle_skill_tag(resp)
+
+            # Check for search tags
+            search_matches = re.findall(r'\[SEARCH:\s*([^\]]+?)\]', resp)
+            if search_matches:
+                search_context = ""
+                for q in search_matches:
+                    sr = self.web_search(q.strip())
+                    search_context += f"\n\nWEB SEARCH RESULTS for \"{q}\":\n{sr}"
+
+                msgs2 = msgs + [{"role": "assistant", "content": resp}]
+                msgs2.append({"role": "system", "content":
+                    f"Web search returned these results. Give a natural answer based on them.\n\n{search_context}"})
+                self.bot.send_chat_action(m.chat.id, 'typing')
+                resp2 = self._query_ai(msgs2)
+                if resp2:
+                    resp = resp2
+
+            # Execute tags
+            tag_results = self._exec_tags(resp)
+            if any(r[0] in ("read", "write", "run") for r in tag_results):
+                self._stats["tags_ok"] = self._stats.get("tags_ok", 0) + 1
+
+            # Parse code blocks → send as files
+            code_block_re = r'```(\w*)\n(.*?)```'
+            code_files = []
+            def _replace_code(m):
+                lang = m.group(1).lower()
+                code = m.group(2)
+                ext_map = {
+                    'python': '.py', 'py': '.py', 'javascript': '.js', 'js': '.js',
+                    'typescript': '.ts', 'ts': '.ts', 'html': '.html', 'css': '.css',
+                    'c': '.c', 'cpp': '.cpp', 'c++': '.cpp', 'c#': '.cs', 'cs': '.cs',
+                    'java': '.java', 'go': '.go', 'rust': '.rs', 'rb': '.rb', 'ruby': '.rb',
+                    'php': '.php', 'bash': '.sh', 'sh': '.sh', 'shell': '.sh',
+                    'powershell': '.ps1', 'ps1': '.ps1', 'sql': '.sql', 'json': '.json',
+                    'yaml': '.yaml', 'yml': '.yml', 'xml': '.xml', 'md': '.md', 'markdown': '.md',
+                    'kotlin': '.kt', 'swift': '.swift', 'lua': '.lua', 'r': '.r',
+                    'haskell': '.hs', 'scala': '.scala', 'dart': '.dart', 'tex': '.tex',
+                }
+                ext = ext_map.get(lang, '.txt')
+                fname = f"script{ext}"
+                code_files.append((fname, code))
+                return f'\n📄 `{fname}` attached\n'
+            display_raw = re.sub(code_block_re, _replace_code, resp, flags=re.DOTALL)
+
+            # Build display text
+            display = re.sub(r'\[(?:SEARCH|READ|WRITE|RUN|LEARN|SKILL):[^\]]*\]', '', display_raw).strip()
+            if not display:
+                display = "(processing completed)"
+
+            # Tag summaries
+            tag_summaries = []
+            for rtype, rname, rcontent in tag_results:
+                if rtype == "read":
+                    tag_summaries.append(f"📄 Read: `{rname}` ({len(rcontent)} chars)")
+                elif rtype == "write":
+                    tag_summaries.append(f"✏️ Written: `{rname}` ({rcontent})")
+                elif rtype == "run":
+                    out_preview = rcontent[:300].replace('\n', ' ').strip()
+                    tag_summaries.append(f"⚡ Ran: `{rname}` → {out_preview}")
+                elif rtype == "search":
+                    tag_summaries.append(f"🔍 Searched: {rname}")
+
+            if tag_summaries:
+                display += "\n\n──\n" + "\n".join(tag_summaries)
+
+            self.messages.append({"role": "assistant", "content": resp})
+            display_html = self._apply_premium_emoji(self._md_to_html(display))
+            self._send_chunked(m.chat.id, display_html, parse_mode="HTML")
+
+            # Send extracted code blocks as files
+            if code_files:
+                import io
+                for fname, fcode in code_files:
+                    bio = io.BytesIO(fcode.encode('utf-8'))
+                    bio.name = fname
+                    try:
+                        self.bot.send_document(m.chat.id, bio, caption=fname)
+                    except Exception:
+                        pass
+
+        def _process_photo(self, m):
+            try:
+                caption = m.caption or "Describe this image in detail"
+                file_id = m.photo[-1].file_id
+                file_info = self.bot.get_file(file_id)
+                downloaded = self.bot.download_file(file_info.file_path)
+
+                import base64
+                b64 = base64.b64encode(downloaded).decode('utf-8')
+
+                self.bot.send_chat_action(m.chat.id, 'typing')
+
+                vision_msg = {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": caption},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    ]
+                }
+
+                data = json.dumps({
+                    "model": "openai/gpt-4o",
+                    "messages": [{"role": "system", "content": self.system}, vision_msg],
+                    "max_tokens": 1024
+                }).encode('utf-8')
+
+                req = urllib.request.Request(self.api_url, data=data, headers={
+                    "Authorization": f"Bearer {self.api_token}",
+                    "Content-Type": "application/json"
+                })
+                resp = urllib.request.urlopen(req, timeout=120)
+                result = json.loads(resp.read().decode('utf-8'))
+                text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+                if text:
+                    self.messages.append({"role": "user", "content": f"[Photo] {caption}"})
+                    self.messages.append({"role": "assistant", "content": text})
+                    text_html = self._apply_premium_emoji(self._md_to_html(text))
+                    self._send_chunked(m.chat.id, text_html, parse_mode="HTML")
+                else:
+                    self.bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Vision model returned empty response', parse_mode="HTML")
+            except Exception as e:
+                self.bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Photo error: %s' % str(e)[:200], parse_mode="HTML")
+
+        def _process_voice(self, m):
+            try:
+                file_id = m.voice.file_id
+                file_info = self.bot.get_file(file_id)
+                downloaded = self.bot.download_file(file_info.file_path)
+
+                self.bot.send_chat_action(m.chat.id, 'typing')
+                status_msg = self.bot.reply_to(m, "🎤 Transcribing voice message...")
+
+                # Multipart form upload for whisper
+                boundary = "----KRESTFormBoundary" + str(int(time.time()))
+                body = (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="model"\r\n\r\n'
+                    f"openai/whisper-1\r\n"
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="file"; filename="audio.ogg"\r\n'
+                    f"Content-Type: audio/ogg\r\n\r\n"
+                ).encode('utf-8') + downloaded + f"\r\n--{boundary}--\r\n".encode('utf-8')
+
+                whisper_url = "https://openrouter.ai/api/v1/audio/transcriptions"
+                req = urllib.request.Request(
+                    whisper_url,
+                    data=body,
+                    headers={
+                        "Authorization": f"Bearer {self.api_token}",
+                        "Content-Type": f"multipart/form-data; boundary={boundary}"
+                    }
+                )
+                resp = urllib.request.urlopen(req, timeout=60)
+                result = json.loads(resp.read().decode('utf-8'))
+                transcript = result.get("text", "")
+
+                try:
+                    self.bot.delete_message(m.chat.id, status_msg.message_id)
+                except:
+                    pass
+
+                if transcript:
+                    self.bot.send_message(m.chat.id, '<tg-emoji emoji-id="5870753782874246579">✍</tg-emoji> <b>Transcript:</b>\n%s' % transcript, parse_mode="HTML")
+                    self._process_user_message(m, transcript)
+                else:
+                    self.bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Could not transcribe audio (empty result)', parse_mode="HTML")
+            except Exception as e:
+                err = str(e)[:200]
+                self.bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Voice error: %s' % err, parse_mode="HTML")
+
+        def _process_document(self, m):
+            try:
+                file_id = m.document.file_id
+                file_info = self.bot.get_file(file_id)
+                downloaded = self.bot.download_file(file_info.file_path)
+                fname = m.document.file_name or "file"
+
+                try:
+                    content = downloaded.decode('utf-8')
+                except UnicodeDecodeError:
+                    try:
+                        content = downloaded.decode('latin-1')
+                    except:
+                        self.bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Cannot read file <code>%s</code> as text' % fname, parse_mode="HTML")
+                        return
+
+                # ── Skill file detection ──
+                skill_name = None
+                try:
+                    js = json.loads(content)
+                    if isinstance(js, dict) and "triggers" in js and "prompt" in js:
+                        skill_name = js.get("name") or os.path.splitext(fname)[0]
+                        self._save_skill(skill_name, {
+                            "triggers": js["triggers"],
+                            "prompt": js["prompt"],
+                            "enabled": js.get("enabled", True)
+                        })
+                        self.bot.send_message(m.chat.id,
+                            '<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> <b>Skill imported:</b> <code>%s</code>\n'
+                            'Triggers: <code>%s</code>' % (skill_name, ', '.join(js['triggers'])),
+                            parse_mode="HTML")
+                        return
+                except (json.JSONDecodeError, Exception):
+                    pass
+
+                if not skill_name and ("skill" in fname.lower() or fname.endswith(".skill")):
+                    lines = content.strip().split("\n", 1)
+                    triggers = [t.strip() for t in lines[0].replace("triggers:", "").strip().split(",") if t.strip()]
+                    prompt = lines[1].strip() if len(lines) > 1 else content
+                    skill_name = os.path.splitext(fname)[0].replace("_", " ").replace("-", " ").title()
+                    if not triggers:
+                        triggers = [skill_name.lower()]
+                    self._save_skill(skill_name, {"triggers": triggers, "prompt": prompt, "enabled": True})
+                    self.bot.send_message(m.chat.id,
+                        '<tg-emoji emoji-id="5870633910337015697">✅</tg-emoji> <b>Skill imported from file:</b> <code>%s</code>' % skill_name,
+                        parse_mode="HTML")
+                    return
+
+                preview = content[:3000]
+                msg = '<tg-emoji emoji-id="5870528606328852614">📄</tg-emoji> <b>File:</b> <code>%s</code> (%s chars)\n<pre>%s</pre>' % (fname, len(content), preview)
+                if len(content) > 3000:
+                    msg += '\n... <b>truncated</b> (%s more chars)' % (len(content)-3000)
+
+                self.bot.send_message(m.chat.id, msg, parse_mode="HTML")
+                self._process_user_message(m, f"Analyze this file ({fname}):\n```\n{content[:5000]}\n```")
+            except Exception as e:
+                self.bot.reply_to(m, '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> File error: %s' % str(e)[:200], parse_mode="HTML")
+
+        def _send_keyboard(self, chat_id):
+            import telebot as _tb
+            kB = _tb.types.KeyboardButton
+            k = _tb.types.ReplyKeyboardMarkup(resize_keyboard=True)
+            k.row(
+                kB("Clear", icon_custom_emoji_id="5870982283724328568"),
+                kB("Model", icon_custom_emoji_id="6030400221232501136"),
+                kB("Help", icon_custom_emoji_id="6028435952299413210"),
+            )
+            k.row(
+                kB("Skills", icon_custom_emoji_id="5940433880585608540"),
+                kB("Context", icon_custom_emoji_id="5870921681735781843"),
+                kB("Stats", icon_custom_emoji_id="5870930636742595124"),
+            )
+            k.row(
+                kB("Save", icon_custom_emoji_id="5870528606328852614"),
+                kB("Feedback", icon_custom_emoji_id="6039422865189638057"),
+            )
+            self.bot.send_message(chat_id,
+                '<tg-emoji emoji-id="5963103826075456248">⬆</tg-emoji> Menu:',
+                reply_markup=k, parse_mode="HTML")
+
+        def _send_chunked(self, chat_id, text, max_len=4000, parse_mode="Markdown"):
+            if not text:
+                text = "(no output)"
+
+            chunks = []
+            remaining = text
+            while remaining:
+                if len(remaining) <= max_len:
+                    chunks.append(remaining)
+                    break
+                split_at = remaining.rfind('\n', 0, max_len)
+                if split_at == -1:
+                    split_at = remaining.rfind('. ', 0, max_len)
+                if split_at == -1:
+                    split_at = remaining.rfind(' ', 0, max_len)
+                if split_at == -1:
+                    split_at = max_len
+                chunks.append(remaining[:split_at])
+                remaining = remaining[split_at:].strip()
+
+            for chunk in chunks:
+                self.bot.send_message(chat_id, chunk, parse_mode=parse_mode)
+
+        def _send_model_page(self, chat_id, msg_id=None):
+            import telebot as _tb
+            page = self._model_page
+            per_page = 10
+            models = self._all_models
+            total = len(models)
+            total_pages = max((total + per_page - 1) // per_page, 1)
+            start = page * per_page
+            end = min(start + per_page, total)
+            page_models = models[start:end]
+
+            markup = _tb.types.InlineKeyboardMarkup(row_width=1)
+            for mdl in page_models:
+                mid = mdl.get("id", "?")
+                label = mid.split("/")[-1] if "/" in mid else mid
+                if len(label) > 35:
+                    label = label[:32] + "..."
+                markup.add(_tb.types.InlineKeyboardButton(label, callback_data=f"mdl:{mid}"))
+
+            nav = []
+            if page > 0:
+                nav.append(_tb.types.InlineKeyboardButton("◀️", callback_data=f"pg:{page-1}"))
+            nav.append(_tb.types.InlineKeyboardButton(
+                f"{page+1}/{total_pages}", callback_data="pg:noop"))
+            if page < total_pages - 1:
+                nav.append(_tb.types.InlineKeyboardButton("▶️", callback_data=f"pg:{page+1}"))
+            if nav:
+                markup.row(*nav)
+
+            text = f"*Models — page {page+1}/{total_pages}  ({total} total)*"
+
+            if msg_id:
+                try:
+                    self.bot.edit_message_text(text, chat_id=chat_id,
+                        message_id=msg_id, parse_mode="Markdown", reply_markup=markup)
+                except Exception:
+                    pass
+            else:
+                self.bot.send_message(chat_id, text,
+                    parse_mode="Markdown", reply_markup=markup)
+
+        def _show_model_picker(self, chat_id, bot=None):
+            import urllib.request, json
+            try:
+                if bot:
+                    bot.send_chat_action(chat_id, 'typing')
+                req = urllib.request.Request(
+                    "https://openrouter.ai/api/v1/models",
+                    headers={"Authorization": f"Bearer {self.api_token}"})
+                resp = urllib.request.urlopen(req, timeout=30)
+                data = json.loads(resp.read().decode('utf-8'))
+                models = data.get("data", data) if isinstance(data, dict) else data
+                self._all_models = models
+                self._model_page = 0
+                self._send_model_page(chat_id)
+            except Exception as e:
+                msg = '<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Error: %s' % str(e)[:200]
+                if bot:
+                    bot.send_message(chat_id, msg, parse_mode="HTML")
+                else:
+                    self.bot.send_message(chat_id, msg, parse_mode="HTML")
+
+        # ── Premium emoji IDs — covers ALL common AI emojis ──
+        _PREMIUM_EMOJI = {
+            # Exact matches from design.txt
+            "\u2705": "5870633910337015697", "\u274c": "5870657884844462243",
+            "\U0001f916": "6030400221232501136", "\U0001f4c1": "5870528606328852614",
+            "\U0001f4c4": "5870528606328852614", "\U0001f642": "5870764288364252592",
+            "\U0001f4ca": "5870921681735781843", "\U0001f4c8": "5870930636742595124",
+            "\u2699\ufe0f": "5870982283724328568", "\u2699": "5870982283724328568",
+            "\U0001f464": "5870994129244131212", "\U0001f465": "5870772616305839506",
+            "\U0001f3d8\ufe0f": "5873147866364514353", "\U0001f512": "6037249452824072506",
+            "\U0001f513": "6037496202990194718", "\U0001f4e3": "6039422865189638057",
+            "\U0001f58b\ufe0f": "5870676941614354370", "\U0001f5d1\ufe0f": "5870875489362513438",
+            "\U0001f5de\ufe0f": "5893057118545646106", "\U0001f4ce": "6039451237743595514",
+            "\U0001f517": "5769289093221454192", "\u2139": "6028435952299413210",
+            "\U0001f441": "6037397706505195857",
+            "\U0001f441\u200d\U0001f5e8": "6037243349675544634",
+            "\u2b06": "5963103826075456248", "\u2b07": "6039802767931871481",
+            "\U0001f514": "6039486778597970865", "\U0001f389": "6041731551845159060",
+            "\U0001f381": "6032644646587338669", "\u23f0": "5983150113483134607",
+            "\u270d": "5870753782874246579", "\U0001f5bc": "6035128606563241721",
+            "\U0001f4cd": "6042011682497106307", "\U0001f45b": "5769126056262898415",
+            "\U0001f4e6": "5884479287171485878", "\U0001f47e": "5260752406890711732",
+            "\U0001f4c5": "5890937706803894250", "\U0001f3f7": "5886285355279193209",
+            "\U0001f553": "5775896410780079073", "\U0001f58c": "6050679691004612757",
+            "\U0001f521": "5771851822897566479", "\u2194\ufe0f": "5778479949572738874",
+            "\U0001fa99": "5904462880941545555", "\U0001f3e7": "5879814368572478751",
+            "\U0001f528": "5940433880585608540", "\U0001f504": "5345906554510012647",
+            "\U0001f503": "5345906554510012647", "\U0001f4f0": "5893057118545646106",
+            # Faces → 🙂
+            "\U0001f600": "5870764288364252592", "\U0001f603": "5870764288364252592",
+            "\U0001f604": "5870764288364252592", "\U0001f601": "5870764288364252592",
+            "\U0001f606": "5870764288364252592", "\U0001f605": "5870764288364252592",
+            "\U0001f602": "5870764288364252592", "\U0001f923": "5870764288364252592",
+            "\U0001f60a": "5870764288364252592", "\U0001f60b": "5870764288364252592",
+            "\U0001f60e": "5870764288364252592", "\U0001f60d": "5870764288364252592",
+            "\U0001f618": "5870764288364252592", "\U0001f617": "5870764288364252592",
+            "\U0001f61a": "5870764288364252592", "\U0001f619": "5870764288364252592",
+            "\U0001f61b": "5870764288364252592", "\U0001f61c": "5870764288364252592",
+            "\U0001f61d": "5870764288364252592", "\U0001f911": "5870764288364252592",
+            "\U0001f917": "5870764288364252592", "\U0001f914": "5870764288364252592",
+            "\U0001f92d": "5870764288364252592", "\U0001f92b": "5870764288364252592",
+            "\U0001f92c": "5870764288364252592", "\U0001f92a": "5870764288364252592",
+            "\U0001f929": "5870764288364252592", "\U0001f928": "5870764288364252592",
+            "\U0001f927": "5870764288364252592", "\U0001f926": "5870764288364252592",
+            "\U0001f937": "5870764288364252592", "\U0001f62d": "5870764288364252592",
+            "\U0001f631": "5870764288364252592", "\U0001f92f": "5870764288364252592",
+            "\U0001f9e0": "5870764288364252592",
+            # People → 👤👥
+            "\U0001f9d1": "5870994129244131212", "\U0001f468": "5870994129244131212",
+            "\U0001f469": "5870994129244131212", "\U0001f476": "5870994129244131212",
+            "\U0001f9d4": "5870994129244131212", "\U0001f9d3": "5870994129244131212",
+            "\U0001f482": "5870994129244131212", "\U0001f477": "5870994129244131212",
+            "\U0001f473": "5870994129244131212", "\U0001f472": "5870994129244131212",
+            "\U0001f935": "5870994129244131212", "\U0001f934": "5870994129244131212",
+            "\U0001f478": "5870994129244131212", "\U0001f9b8": "5870994129244131212",
+            "\U0001f9b9": "5870994129244131212", "\U0001f9d9": "5870994129244131212",
+            "\U0001f9da": "5870994129244131212", "\U0001f9db": "5870994129244131212",
+            "\U0001f9dc": "5870994129244131212", "\U0001f9dd": "5870994129244131212",
+            "\U0001f64b": "5870994129244131212", "\U0001f647": "5870994129244131212",
+            "\U0001f64d": "5870994129244131212", "\U0001f64e": "5870994129244131212",
+            "\U0001f645": "5870994129244131212", "\U0001f646": "5870994129244131212",
+            "\U0001f481": "5870994129244131212", "\U0001f64f": "5870994129244131212",
+            "\U0001f44f": "5870994129244131212", "\U0001f64c": "5870994129244131212",
+            "\U0001f91d": "5870772616305839506", "\U0001f46a": "5870772616305839506",
+            "\U0001f491": "5870772616305839506",
+            # Approval / disapproval
+            "\U0001f44d": "5870633910337015697", "\U0001f44e": "5870657884844462243",
+            "\u2714\ufe0f": "5870633910337015697", "\u2716\ufe0f": "5870657884844462243",
+            "\u26d4": "5870657884844462243", "\U0001f6ab": "5870657884844462243",
+            # Energy / attention → ⚙ or 🎉
+            "\u26a1": "5870982283724328568", "\u2757": "5870982283724328568",
+            "\u203c\ufe0f": "5870982283724328568", "\u26a0\ufe0f": "5870982283724328568",
+            "\U0001f525": "6041731551845159060", "\U0001f4a5": "6041731551845159060",
+            "\U0001f4a2": "6041731551845159060",
+            # Stars / sparkle → 🎉
+            "\U0001f31f": "6041731551845159060", "\u2b50": "6041731551845159060",
+            "\u2728": "6041731551845159060", "\U0001f31b": "6041731551845159060",
+            "\U0001f31e": "6041731551845159060",
+            # Ideas / thinking → ℹ or 🤖
+            "\U0001f4a1": "6028435952299413210", "\U0001f4ac": "6039422865189638057",
+            "\U0001f5e8\ufe0f": "6039422865189638057", "\U0001f4ad": "6039422865189638057",
+            "\u2753": "6028435952299413210", "\u2754": "6028435952299413210",
+            # Rocket (AI uses too often) → ⬆
+            "\U0001f680": "5963103826075456248",
+            "\U0001f680\ufe0f": "5963103826075456248",
+            # Search → 👁
+            "\U0001f50d": "6037397706505195857", "\U0001f50e": "6037397706505195857",
+            "\U0001f50f": "6037397706505195857",
+            # Tech → 🤖
+            "\U0001f4bb": "6030400221232501136", "\U0001f5a5\ufe0f": "6030400221232501136",
+            "\U0001f5b1\ufe0f": "6030400221232501136", "\U0001f4f1": "6030400221232501136",
+            "\U0001f4f7": "6035128606563241721", "\U0001f4f8": "6035128606563241721",
+            "\U0001f4f9": "6035128606563241721", "\U0001f4fd\ufe0f": "6035128606563241721",
+            "\U0001f39e\ufe0f": "6035128606563241721", "\U0001f3a5": "6035128606563241721",
+            "\U0001f3ac": "6035128606563241721",
+            # Communication → 📣
+            "\U0001f4e2": "6039422865189638057", "\U0001f4de": "6039422865189638057",
+            "\U0001f4df": "6039422865189638057", "\U0001f4e0": "6039422865189638057",
+            "\U0001f50a": "6039422865189638057",
+            # Mail / storage → 📁
+            "\U0001f4e7": "5870528606328852614", "\u2709\ufe0f": "5870528606328852614",
+            "\U0001f48c": "5870528606328852614", "\U0001f4e9": "5870528606328852614",
+            "\U0001f4c2": "5870528606328852614", "\U0001f4c3": "5870528606328852614",
+            "\U0001f4be": "5870528606328852614", "\U0001f4bd": "5870528606328852614",
+            # Security → 🔒
+            "\U0001f511": "6037249452824072506", "\U0001f510": "6037249452824072506",
+            "\U0001f6e1\ufe0f": "6037249452824072506",
+            # Money → 👛 or 🪙
+            "\U0001f4b0": "5904462880941545555", "\U0001f4b5": "5904462880941545555",
+            "\U0001f4b2": "5904462880941545555", "\U0001f4b8": "5904462880941545555",
+            "\U0001f4b3": "5904462880941545555",
+            # Music / fun → 🎉
+            "\U0001f3b5": "6041731551845159060", "\U0001f3b6": "6041731551845159060",
+            "\U0001f3a4": "6041731551845159060", "\U0001f3a9": "6041731551845159060",
+            "\U0001f308": "6041731551845159060", "\U0001f3ab": "6041731551845159060",
+            "\U0001f3c6": "6041731551845159060", "\U0001f3c5": "6041731551845159060",
+            "\U0001f396\ufe0f": "6041731551845159060",
+            # Tools → 🔨
+            "\U0001f6e0\ufe0f": "5940433880585608540", "\U0001f527": "5940433880585608540",
+            "\U0001f529": "5940433880585608540", "\U0001f52b": "5940433880585608540",
+            "\U0001f4aa": "5940433880585608540", "\U0001f9f0": "5940433880585608540",
+            # Writing → ✍
+            "\U0001f4dd": "5870753782874246579", "\U0001f4cb": "5886285355279193209",
+            # Direction → ⬆⬇
+            "\u2b05\ufe0f": "6039802767931871481", "\u27a1\ufe0f": "5963103826075456248",
+            "\u2197\ufe0f": "5963103826075456248", "\u2198\ufe0f": "6039802767931871481",
+            "\u2196\ufe0f": "6039802767931871481", "\u2199\ufe0f": "6039802767931871481",
+            "\u21a9\ufe0f": "5963103826075456248", "\u21aa\ufe0f": "6039802767931871481",
+            # Time → ⏰
+            "\u23f3": "5983150113483134607", "\u231a": "5983150113483134607",
+            "\U0001f551": "5983150113483134607", "\U0001f552": "5983150113483134607",
+            "\U0001f553": "5775896410780079073", "\U0001f554": "5775896410780079073",
+            "\U0001f555": "5775896410780079073", "\U0001f556": "5775896410780079073",
+            "\U0001f557": "5775896410780079073", "\U0001f558": "5775896410780079073",
+            "\U0001f559": "5775896410780079073", "\U0001f55a": "5775896410780079073",
+            "\U0001f55b": "5775896410780079073",
+            # Paper → 📎🔗
+            "\U0001f587\ufe0f": "6039451237743595514", "\U0001f4cc": "6042011682497106307",
+            # Houses / buildings
+            "\U0001f3e0": "5873147866364514353", "\U0001f3e1": "5873147866364514353",
+            "\U0001f3e2": "5873147866364514353", "\U0001f3e3": "5873147866364514353",
+            "\U0001f3e4": "5873147866364514353", "\U0001f3e5": "5873147866364514353",
+            "\U0001f3e6": "5873147866364514353",
+            # Date → 📅
+            "\U0001f4c6": "5890937706803894250", "\U0001f5d3\ufe0f": "5890937706803894250",
+            # Arrow ↔️
+            "\u21d4\ufe0f": "5778479949572738874", "\u21d2": "5963103826075456248",
+            "\u21d0": "6039802767931871481", "\u21e8": "5963103826075456248",
+            # Games → 👾
+            "\U0001f3ae": "5260752406890711732", "\U0001f3b2": "5260752406890711732",
+            "\U0001f579\ufe0f": "5260752406890711732", "\U0001f3b0": "5260752406890711732",
+            # Misc
+            "\U0001f3a8": "6050679691004612757", "\U0001f4f2": "5870528606328852614",
+            "\U0001f4f3": "5870528606328852614", "\U0001f4e1": "6039422865189638057",
+            "\U0001f4e4": "5870528606328852614", "\U0001f4e5": "5870528606328852614",
+            "\u267b\ufe0f": "5345906554510012647", "\U0001f3d9\ufe0f": "5873147866364514353",
+            "\U0001f3db\ufe0f": "5873147866364514353", "\U0001f3dc\ufe0f": "5873147866364514353",
+            "\U0001f3dd\ufe0f": "5873147866364514353",
+            "\U0001f6a7": "5870657884844462243",  # 🚧 construction → ❌
+            "\U0001f4a3": "5870982283724328568",  # 💣 bomb → ⚙
+            "\U0001f52a": "5940433880585608540",  # 🔪 knife/hammer
+            "\U0001f6e1": "6037249452824072506",  # 🛡 shield/lock
+            "\U0001f6e1\ufe0f": "6037249452824072506",
+        }
+
+        def _md_to_html(self, text):
+            text = re.sub(r'\*([^*]+)\*', r'<b>\1</b>', text)
+            text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+            text = re.sub(r'_([^_]+)_', r'<i>\1</i>', text)
+            return text
+
+        def _apply_premium_emoji(self, text):
+            for ch, eid in self._PREMIUM_EMOJI.items():
+                if eid and ch in text:
+                    text = text.replace(ch, '<tg-emoji emoji-id="%s">%s</tg-emoji>' % (eid, ch))
+            return text
+
+        def start(self):
+            self.running = True
+            def _poll():
+                try:
+                    self.bot.infinity_polling(timeout=30, long_polling_timeout=10, skip_pending=True)
+                except Exception as e:
+                    if "409" in str(e):
+                        import time
+                        time.sleep(2)
+                        try:
+                            self.bot.infinity_polling(timeout=30, long_polling_timeout=10, skip_pending=True)
+                        except Exception as e2:
+                            print(f"[KREST] Telegram 409 conflict (retry failed): {e2}")
+                    else:
+                        print(f"[KREST] Telegram polling error: {e}")
+            self.thread = threading.Thread(target=_poll, daemon=True)
+            self.thread.start()
+
+        def stop(self):
+            self.running = False
+            try:
+                self.bot.stop_polling()
+            except:
+                pass
+
     # ── Header ────────────────────────────────────────────────────
     def print_header():
         cols = get_terminal_size().columns
@@ -379,6 +1447,7 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
                 ("/save","Force-save current session"),
                 ("/export","Export session to JSON"),
                 ("/input <file>","Send file as message"),
+                ("/tgbot","Start/stop Telegram bot"),
                 ("/exit","Quit KREST")]
         progs = [("[SEARCH:query]","Web search (results fed back to AI)"),
                  ("[READ:path]","Read any file"),
@@ -595,7 +1664,109 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
             if has_rich: con.print(f"[dim]session saved: [cyan]{SID}[/][/]")
             else: w(f"  {c('saved:', 'green')} {c(SID, 'cyan')}\n")
             return True
+        if name == "/tgbot":
+            if not _has_telebot:
+                if has_rich:
+                    con.print("[red]telebot not installed. Run: pip install pyTelegramBotAPI[/]")
+                else:
+                    w(f"  {c('telebot not installed. Run: pip install pyTelegramBotAPI', 'red')}\n")
+                return True
+
+            inst = telegram_bot_instance[0]
+            if inst is not None and inst.running:
+                inst.stop()
+                telegram_bot_instance[0] = None
+                import time
+                time.sleep(1.5)
+                if has_rich:
+                    con.print("[yellow]Telegram bot stopped[/]")
+                else:
+                    w(f"  {c('Telegram bot stopped', 'yellow')}\n")
+                return True
+
+            # Try auto-start from config
+            if os.path.exists(TG_CONFIG_PATH):
+                try:
+                    with open(TG_CONFIG_PATH, 'r') as f:
+                        cfg = json.load(f)
+                    token = cfg.get('token', '')
+                    trusted_id = cfg.get('trusted_user_id', 0)
+                    if token and trusted_id:
+                        bot = TelegramBotInstance(token, trusted_id, web_search, SYSTEM, MODEL, API_URL, TOKEN)
+                        bot.start()
+                        telegram_bot_instance[0] = bot
+                        if has_rich:
+                            con.print(f"[bold green]✓ Telegram bot started![/]")
+                            con.print(f" [dim]Trusted user ID: [cyan]{trusted_id}[/][/]")
+                        else:
+                            w(f"  {c('✓ Telegram bot started!', 'green')}\n")
+                            w(f"  {c('Trusted user ID: ' + str(trusted_id), 'dim')}\n")
+                        return True
+                except:
+                    pass
+
+            # Manual config
+            if has_rich:
+                con.print("[bold cyan]╔══ Telegram Bot Setup ══╗[/]")
+                con.print("[bold cyan]║  Configure your KREST bot[/]")
+                con.print("[bold cyan]╚════════════════════════╝[/]")
+            else:
+                w(c("\n  === Telegram Bot Setup ===\n", "cyan", "bold"))
+
+            if has_rich:
+                token = Prompt.ask(" [bold yellow]🤖 Bot token from @BotFather[/]").strip()
+            else:
+                w(f"  {c('🤖 Bot token from @BotFather:', 'yellow')} ")
+                token = input().strip()
+            while not token:
+                if has_rich:
+                    token = Prompt.ask(" [red]Cannot be empty[/]\n [bold yellow]🤖 Bot token[/]").strip()
+                else:
+                    w(f"\n  {c('Cannot be empty', 'red')}")
+                    w(f"\n  {c('🤖 Bot token:', 'yellow')} ")
+                    token = input().strip()
+
+            if has_rich:
+                tid_str = Prompt.ask(" [bold yellow]👤 Trusted Telegram user ID (numeric)[/]").strip()
+            else:
+                w(f"  {c('👤 Trusted Telegram user ID (numeric):', 'yellow')} ")
+                tid_str = input().strip()
+            while not tid_str.isdigit():
+                if has_rich:
+                    tid_str = Prompt.ask(" [red]Must be numeric[/]\n [bold yellow]👤 Enter user ID[/]").strip()
+                else:
+                    w(f"\n  {c('Must be numeric', 'red')}")
+                    w(f"\n  {c('👤 Enter user ID:', 'yellow')} ")
+                    tid_str = input().strip()
+            trusted_id = int(tid_str)
+
+            cfg = {"token": token, "trusted_user_id": trusted_id}
+            try:
+                with open(TG_CONFIG_PATH, 'w') as f:
+                    json.dump(cfg, f, indent=2)
+                if has_rich:
+                    con.print(f"[dim]Config saved to {TG_CONFIG_PATH}[/]")
+            except Exception as e:
+                if has_rich:
+                    con.print(f"[red]Failed to save config: {e}[/]")
+                else:
+                    w(f"  {c('Failed to save config: ' + str(e), 'red')}\n")
+
+            bot = TelegramBotInstance(token, trusted_id, web_search, SYSTEM, MODEL, API_URL, TOKEN)
+            bot.start()
+            telegram_bot_instance[0] = bot
+            if has_rich:
+                con.print(f"[bold green]✓ Telegram bot started![/]")
+                con.print(f" [dim]Only user ID [cyan]{trusted_id}[/] can interact[/]")
+                con.print(f" [dim]Type [cyan]/tgbot[/] again to stop[/]")
+            else:
+                w(f"  {c('✓ Telegram bot started!', 'green')}\n")
+                w(f"  {c('Only user ' + str(trusted_id) + ' can interact', 'dim')}\n")
+            return True
         if name in ("/exit", "/quit", "/q"):
+            inst = telegram_bot_instance[0]
+            if inst is not None:
+                inst.stop()
             w(c("  bye!\n", "green"))
             sys.exit(0)
         if name == "/stats":
@@ -643,6 +1814,9 @@ Domains: web apps, CLIs, GUIs, games, kernels, drivers, firmware, compilers, rev
                 w(f"\n  {c('>', 'cyan')} {c('you', 'dim')} {c('>', 'cyan')} ")
                 user_input = input().strip()
         except (EOFError, KeyboardInterrupt):
+            inst = telegram_bot_instance[0]
+            if inst is not None:
+                inst.stop()
             w(f"\n  {c('bye!', 'green', 'dim')}\n"); break
 
         if not user_input: continue
