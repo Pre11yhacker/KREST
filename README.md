@@ -1,6 +1,6 @@
 <div align="center">
 
-<img width="100%" src="https://capsule-render.vercel.app/api?type=waving&height=280&color=0:0F0717,30:1A102B,70:7C3AED,100:A855F7&text=KREST&fontColor=FFFFFF&fontSize=90&fontAlignY=40&animation=fadeIn[...]
+<img width="100%" src="https://capsule-render.vercel.app/api?type=waving&height=280&color=0:0F0717,30:1A102B,70:7C3AED,100:A855F7&text=KREST&fontColor=FFFFFF&fontSize=90&fontAlignY=40&animation=fadeIn[...]>
 
 # ⚡ KREST
 
